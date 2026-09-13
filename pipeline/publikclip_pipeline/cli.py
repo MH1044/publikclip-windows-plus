@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import librosa
 
 from . import config
 from .jobs import queue
