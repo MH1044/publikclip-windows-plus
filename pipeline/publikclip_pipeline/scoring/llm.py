@@ -110,7 +110,7 @@ class GeminiClient:
             },
         }
         last_err: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(10):
             try:
                 res = httpx.post(
                     GEMINI_URL.format(model=self.model),
@@ -131,9 +131,9 @@ class GeminiClient:
                     except Exception:  # noqa: BLE001
                         detail = "rate limited"
                     last_err = LlmError(f"Gemini 429: {detail}")
-                    if "credit" in detail.lower() or "billing" in detail.lower():
+                    if "credit" in detail.lower():
                         raise last_err
-                    time.sleep(4 * (attempt + 1))
+                    time.sleep(65)
                     continue
                 res.raise_for_status()
                 payload = res.json()
