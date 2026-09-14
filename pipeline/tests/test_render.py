@@ -29,8 +29,9 @@ def test_sendcmd_dedupes_to_change_points():
 
 
 def test_chunking_rules():
+    preset = ass_mod.PRESETS["classic"]
     words = [ass_mod.Word(f"w{i}", i * 0.3, i * 0.3 + 0.25) for i in range(6)]
-    chunks = ass_mod.chunk_words(words)
+    chunks = ass_mod.chunk_words(words, preset)
     assert [len(c.words) for c in chunks] == [4, 2]  # budget break
 
     words = [
@@ -38,7 +39,7 @@ def test_chunking_rules():
         ass_mod.Word("so", 0.4, 0.6),
         ass_mod.Word("anyway", 2.0, 2.4),  # >0.6s pause before this
     ]
-    chunks = ass_mod.chunk_words(words)
+    chunks = ass_mod.chunk_words(words, preset)
     assert len(chunks) == 3  # punctuation break + pause break
 
 

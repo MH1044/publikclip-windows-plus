@@ -10,7 +10,8 @@ over our own word/event structures:
   - Words are never individually scaled (advance-width reflow makes the
     line vibrate); the chunk gets one entrance pop via \\fscx/\\fscy on the
     whole line's first event only.
-  - Chunk breaks at punctuation OR a pause > 0.6 s OR the word budget.
+  - Chunk breaks at punctuation OR a pause > 0.6 s OR the word budget OR
+    rendered width (measured against the preset's bundled font).
   - Emphasis is OR-combined: power-word/numeric baseline + prosodic
     per-word RMS (top quantile within the clip) — the layer nobody
     surveyed implements (RESEARCH gap, cheap and deterministic).
@@ -24,6 +25,7 @@ THEBOLDFONT has unresolved licensing, so it was deliberately not vendored.
 
 from __future__ import annotations
 
+import functools
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +34,7 @@ FONTS_DIR = Path(__file__).parent / "fonts"
 
 CHUNK_MAX_WORDS = 4
 CHUNK_PAUSE_BREAK = 0.6
+CHUNK_MAX_WIDTH_PX = 900  # ~30px slack inside the 960px usable width (1080 - 2*60 margin)
 EMPHASIS_RMS_QUANTILE = 0.85
 
 PLAY_RES_X = 1080
@@ -144,11 +147,36 @@ class Chunk:
         return self.words[-1].end
 
 
-def chunk_words(words: list[Word]) -> list[Chunk]:
-    """Punctuation OR pause > 0.6 s OR budget (ViralMint rule)."""
+@functools.lru_cache(maxsize=None)
+def _font_for_preset(preset_name: str) -> "ImageFont.FreeTypeFont":
+    from PIL import ImageFont
+
+    preset = PRESETS[preset_name]
+    return ImageFont.truetype(str(FONTS_DIR / preset.font_file), preset.size)
+
+
+def _rendered_width(text: str, preset: Preset) -> float:
+    """Rendered pixel width of `text` in `preset`'s bundled font, including
+    the outline (drawn on both sides) — what actually has to fit inside the
+    frame's usable width."""
+    font = _font_for_preset(preset.name)
+    rendered = text.upper() if preset.uppercase else text
+    return font.getlength(rendered) + 2 * preset.outline
+
+
+def chunk_words(words: list[Word], preset: Preset) -> list[Chunk]:
+    """Punctuation OR pause > 0.6 s OR budget (ViralMint rule) OR rendered
+    width — a chunk that would overflow CHUNK_MAX_WIDTH_PX breaks early. A
+    single word wider than the limit still gets its own chunk (WrapStyle 0
+    wraps it if libass still can't fit it)."""
     chunks: list[Chunk] = []
     current = Chunk()
     for i, word in enumerate(words):
+        if current.words:
+            candidate_text = " ".join(w.text for w in current.words) + " " + word.text
+            if _rendered_width(candidate_text, preset) > CHUNK_MAX_WIDTH_PX:
+                chunks.append(current)
+                current = Chunk()
         current.words.append(word)
         nxt = words[i + 1] if i + 1 < len(words) else None
         should_break = (
@@ -200,7 +228,7 @@ def _header(preset: Preset) -> str:
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
         f"PlayResX: {PLAY_RES_X}\nPlayResY: {PLAY_RES_Y}\n"
-        "ScaledBorderAndShadow: yes\nWrapStyle: 2\n\n"
+        "ScaledBorderAndShadow: yes\nWrapStyle: 0\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
         "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
@@ -244,7 +272,7 @@ def build_ass(
     preset = PRESETS.get(preset_name, PRESETS["classic"])
     lines = [_header(preset)]
 
-    for chunk in chunk_words(words):
+    for chunk in chunk_words(words, preset):
         for i, word in enumerate(chunk.words):
             start = word.start
             end = chunk.words[i + 1].start if i + 1 < len(chunk.words) else chunk.end
