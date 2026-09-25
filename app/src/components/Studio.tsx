@@ -39,6 +39,16 @@ interface Props {
   onResume: (id: string, llm?: string) => void
 }
 
+// Windows "Copy as path" wraps the path in quotes; drop a matching pair so the
+// pipeline gets a real path instead of one that starts with a quote character.
+function cleanSource(raw: string): string {
+  const s = raw.trim()
+  if (s.length >= 2 && s[0] === s[s.length - 1] && (s[0] === '"' || s[0] === "'")) {
+    return s.slice(1, -1).trim()
+  }
+  return s
+}
+
 export default function Studio({ jobs, running, stages, error, onRun, onOpenLoop, onOpenJob, onResume }: Props) {
   const [source, setSource] = useState('')
   const [llm, setLlm] = useState('publik')
@@ -138,14 +148,14 @@ export default function Studio({ jobs, running, stages, error, onRun, onOpenLoop
             <input
               value={source}
               onChange={(e) => setSource(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && source.trim() && !running && onRun(source.trim(), llm, captions)}
+              onKeyDown={(e) => e.key === 'Enter' && cleanSource(source) && !running && onRun(cleanSource(source), llm, captions)}
               placeholder="YouTube URL or a path to a video file"
               disabled={running}
             />
             <button
               className="btn-primary"
-              onClick={() => onRun(source.trim(), llm, captions)}
-              disabled={running || !source.trim()}
+              onClick={() => onRun(cleanSource(source), llm, captions)}
+              disabled={running || !cleanSource(source)}
             >
               {running ? 'WORKING' : 'CUT IT'}
             </button>

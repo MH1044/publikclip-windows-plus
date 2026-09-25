@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 from . import config
 from .jobs import queue
@@ -115,9 +116,26 @@ def _ensure_pipeline_deps(jsonl: bool, emit) -> tuple[bool, str | None]:
     return True, None
 
 
+def normalize_source(raw: str) -> tuple[str, str]:
+    """Turn what the user typed into a (source_type, source) pair.
+
+    Windows' "Copy as path" wraps the path in double quotes, and people paste
+    it as-is; left alone, a path that starts with a quote character is a
+    *relative* path that the ingest stage resolves against the sidecar's
+    working directory. Strip a matching pair of quotes, then pin local files
+    to an absolute path at job-creation time so the stored source does not
+    depend on whoever runs it later.
+    """
+    source = raw.strip()
+    if len(source) >= 2 and source[0] == source[-1] and source[0] in "\"'":
+        source = source[1:-1].strip()
+    if source.startswith(("http://", "https://")):
+        return "url", source
+    return "file", str(Path(source).expanduser().resolve())
+
+
 def cmd_run(args: argparse.Namespace) -> int:
-    source = args.source
-    source_type = "url" if source.startswith(("http://", "https://")) else "file"
+    source_type, source = normalize_source(args.source)
     settings = config.Settings()
     if args.llm:
         settings.llm_mode = args.llm
