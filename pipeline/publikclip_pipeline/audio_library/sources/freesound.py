@@ -32,7 +32,7 @@ def _key() -> str:
     key = None
     if secrets_path.exists():
         try:
-            key = json.loads(secrets_path.read_text()).get("freesound_key")
+            key = json.loads(secrets_path.read_text(encoding="utf-8")).get("freesound_key")
         except (json.JSONDecodeError, OSError):
             key = None
     if not key:

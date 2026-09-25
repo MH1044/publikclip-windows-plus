@@ -92,7 +92,7 @@ def _secrets() -> dict:
     if not path.exists():
         return {}
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return {}
     return data if isinstance(data, dict) else {}
@@ -117,7 +117,7 @@ def publik_credential() -> dict | None:
     shared = config.publik_shared_file()
     if shared.exists():
         try:
-            data = json.loads(shared.read_text())
+            data = json.loads(shared.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return None
         if isinstance(data, dict) and data.get("key"):
@@ -165,7 +165,7 @@ def resolve_endpoint(llm_mode: str) -> Endpoint:
 
 def _read_publik_status() -> dict:
     try:
-        data = json.loads(config.publik_status_path().read_text())
+        data = json.loads(config.publik_status_path().read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
@@ -196,7 +196,7 @@ def _record_publik_status(res: httpx.Response, extra: dict | None = None) -> Non
     try:
         path = config.publik_status_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(status))
+        path.write_text(json.dumps(status), encoding="utf-8")
     except OSError:
         pass
 
@@ -296,7 +296,7 @@ class GeminiClient:
         key = _cache_key(self.backend, self.model, prompt, schema, images)
         cache_file = _cache_dir() / f"{key}.json"
         if cache_file.exists():
-            return json.loads(cache_file.read_text())
+            return json.loads(cache_file.read_text(encoding="utf-8"))
 
         parts: list[dict[str, Any]] = [{"text": prompt}]
         for img in images:
@@ -359,7 +359,7 @@ class GeminiClient:
                 payload = res.json()
                 text = payload["candidates"][0]["content"]["parts"][0]["text"]
                 data = json.loads(_strip_fences(text))
-                cache_file.write_text(json.dumps(data))
+                cache_file.write_text(json.dumps(data), encoding="utf-8")
                 return data
             except LlmError:
                 raise
@@ -394,7 +394,7 @@ class OllamaClient:
             images = []
         cache_file = _cache_dir() / f"{_cache_key(self.backend, self.model, prompt, schema, [])}.json"
         if cache_file.exists():
-            return json.loads(cache_file.read_text())
+            return json.loads(cache_file.read_text(encoding="utf-8"))
         body = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
@@ -408,7 +408,7 @@ class OllamaClient:
             data = json.loads(_strip_fences(res.json()["message"]["content"]))
         except (httpx.HTTPError, KeyError, json.JSONDecodeError) as err:
             raise LlmError(f"Ollama call failed: {err}") from err
-        cache_file.write_text(json.dumps(data))
+        cache_file.write_text(json.dumps(data), encoding="utf-8")
         return data
 
 

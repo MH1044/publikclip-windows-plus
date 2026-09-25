@@ -94,7 +94,7 @@ def load_index() -> dict[str, Item]:
     if not p.exists():
         return {}
     try:
-        raw = json.loads(p.read_text())
+        raw = json.loads(p.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return {}
     return {k: Item.from_json(v) for k, v in raw.items()}
@@ -103,7 +103,7 @@ def load_index() -> dict[str, Item]:
 def save_index(items: dict[str, Item]) -> None:
     ensure_root()
     tmp = _index_path().with_suffix(".tmp")
-    tmp.write_text(json.dumps({k: v.to_json() for k, v in items.items()}, indent=1))
+    tmp.write_text(json.dumps({k: v.to_json() for k, v in items.items()}, indent=1), encoding="utf-8")
     tmp.replace(_index_path())
 
 

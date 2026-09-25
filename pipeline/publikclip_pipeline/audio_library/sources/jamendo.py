@@ -29,7 +29,7 @@ def _client_id() -> str:
     client_id = None
     if secrets_path.exists():
         try:
-            client_id = json.loads(secrets_path.read_text()).get("jamendo_client_id")
+            client_id = json.loads(secrets_path.read_text(encoding="utf-8")).get("jamendo_client_id")
         except (json.JSONDecodeError, OSError):
             client_id = None
     if not client_id:

@@ -61,7 +61,7 @@ def load_class_indices() -> dict[int, str]:
     """AudioSet index → bus event type, for the classes we track."""
     csv_path = Path(__file__).parent.parent / "vendor" / "panns" / "class_labels_indices.csv"
     mapping: dict[int, str] = {}
-    with open(csv_path) as fh:
+    with open(csv_path, encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
             name = row["display_name"].strip('"')
             if name in CLASS_MAP:
