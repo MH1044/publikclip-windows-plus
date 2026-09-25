@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
 from . import config
 from .jobs import queue
@@ -63,9 +64,78 @@ def _emit_result(jsonl: bool, payload: dict) -> None:
         print(json.dumps(payload, indent=2))
 
 
+def _ensure_pipeline_deps(jsonl: bool, emit) -> tuple[bool, str | None]:
+    """First-run bootstrap for the `pipeline` dependency-group (whisperx,
+    torch-via-whisperx, opencv, speechbrain, ...).
+
+    That group is deliberately NOT one of uv's default-groups (see
+    pyproject.toml) — a bare `uv run publikclip ...` (exactly what the
+    desktop app's sidecar spawns) would otherwise try to sync it, and every
+    dependency in the whole graph, before `main()` gets to run at all: if
+    that opaque pre-launch sync fails (no network, a blocked host, a first
+    run interrupted), the child exits non-zero having written to stdout
+    only ever once `job` has already been printed by `_execute()` below.
+
+    Returns (ok, error_message). On failure, error_message is the real
+    stderr tail from `uv sync`, suitable for `_emit_result`.
+    """
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    marker = config.home_dir() / ".pipeline_deps_synced"
+    if marker.exists():
+        return True, None
+
+    emit("env", -1, "Installing pipeline dependencies (one-time setup)…")
+    pipeline_dir = Path(__file__).resolve().parent.parent
+    uv_bin = shutil.which("uv") or "uv"
+    try:
+        proc = subprocess.run(
+            # --frozen for the same reason main.rs passes it: in a packaged
+            # build pipeline_dir is inside the app bundle, and re-locking
+            # would write uv.lock there. UV_PROJECT_ENVIRONMENT (set by the
+            # shell that spawned us) keeps the venv itself out too.
+            [uv_bin, "--directory", str(pipeline_dir), "sync", "--frozen", "--group", "pipeline"],
+            capture_output=True,
+            text=True,
+            timeout=3600,
+        )
+    except Exception as err:  # noqa: BLE001 — surface, don't crash silently
+        return False, f"could not start `uv sync --group pipeline`: {err}"
+
+    if proc.returncode != 0:
+        tail = "\n".join((proc.stderr or proc.stdout or "").strip().splitlines()[-12:])
+        return False, tail or f"`uv sync --group pipeline` exited {proc.returncode}"
+
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("ok", encoding="utf-8")
+    except OSError:
+        pass  # best-effort cache; a missing marker just re-syncs (fast, no-op) next run
+    return True, None
+
+
+def normalize_source(raw: str) -> tuple[str, str]:
+    """Turn what the user typed into a (source_type, source) pair.
+
+    Windows' "Copy as path" wraps the path in double quotes, and people paste
+    it as-is; left alone, a path that starts with a quote character is a
+    *relative* path that the ingest stage resolves against the sidecar's
+    working directory. Strip a matching pair of quotes, then pin local files
+    to an absolute path at job-creation time so the stored source does not
+    depend on whoever runs it later.
+    """
+    source = raw.strip()
+    if len(source) >= 2 and source[0] == source[-1] and source[0] in "\"'":
+        source = source[1:-1].strip()
+    if source.startswith(("http://", "https://")):
+        return "url", source
+    return "file", str(Path(source).expanduser().resolve())
+
+
 def cmd_run(args: argparse.Namespace) -> int:
-    source = args.source
-    source_type = "url" if source.startswith(("http://", "https://")) else "file"
+    source_type, source = normalize_source(args.source)
     settings = config.Settings()
     if args.llm:
         settings.llm_mode = args.llm
@@ -103,10 +173,34 @@ def _execute(job: queue.Job, jsonl: bool) -> int:
         print(json.dumps({"event": "job", "job_id": job.id, "dir": str(job.dir)}), flush=True)
     else:
         print(f"job {job.id} → {job.dir}", file=sys.stderr)
+    ok, err = _ensure_pipeline_deps(jsonl, emit)
+    if not ok:
+        message = f"Couldn't install pipeline dependencies (one-time setup): {err}"
+        # run_stages() never ran, so nothing else will move this job off
+        # "pending" -- record the failure here or the row stays pending
+        # forever and `publikclip jobs` shows it as still queued.
+        queue.set_job_status(job.id, "failed", message)
+        _emit_result(jsonl, {"ok": False, "job_id": job.id, "error": message})
+        return 1
     try:
         results = queue.run_stages(job, _stages(), emit)
     except queue.StageError as err:
         _emit_result(jsonl, {"ok": False, "job_id": job.id, "error": str(err)})
+        return 1
+    except Exception as err:  # noqa: BLE001 — a stage crash must still emit a result event
+        # A stage's underlying dependency (whisperX/huggingface_hub during
+        # model load, ffmpeg, torch, …) can raise its own exception type
+        # instead of queue.StageError. Previously that escaped this
+        # function uncaught, killed the sidecar with a bare traceback, and
+        # left main.rs/App.tsx with no "result" event to show — just the
+        # generic "pipeline exited unexpectedly" banner while the UI was
+        # still on the last progress message. run_stages() already recorded
+        # stage attribution before re-raising (mark_stage + set_job_status),
+        # so read that back: it names the stage that died, which a bare
+        # repr(err) does not.
+        failed_job = queue.get_job(job.id)
+        error = failed_job.error if failed_job and failed_job.error else repr(err)
+        _emit_result(jsonl, {"ok": False, "job_id": job.id, "error": error})
         return 1
     summary = {
         "ok": True,
@@ -145,12 +239,12 @@ def cmd_edit(args: argparse.Namespace) -> int:
         return 0
 
     if args.edit_cmd == "suggest-visuals":
-        score = json.loads((job_dir / "score.json").read_text())["data"]
+        score = json.loads((job_dir / "score.json").read_text(encoding="utf-8"))["data"]
         clip = score["clips"][args.clip]
         edit = store.edit_for_clip(job_dir, args.clip, clip)
         # plan against OUTPUT-time words = current bounds without dead-space
         # (suggestions land on the source-bounds timeline the UI shows)
-        diarize = json.loads((job_dir / "diarize.json").read_text())["data"]
+        diarize = json.loads((job_dir / "diarize.json").read_text(encoding="utf-8"))["data"]
         words = [
             {"word": w["word"], "start": w["start"] - edit.start, "end": w["end"] - edit.start}
             for seg in diarize["segments"]
@@ -180,6 +274,15 @@ def cmd_edit(args: argparse.Namespace) -> int:
             _emit_result(args.jsonl, {"ok": False, "error": str(err)})
             return 1
         _emit_result(args.jsonl, {"ok": True, "output": entry})
+        return 0
+
+    if args.edit_cmd == "audio-suggest":
+        try:
+            suggestions = rc.suggest_audio_for_clip(job_dir, args.clip)
+        except Exception as err:  # noqa: BLE001 — surface, don't crash the app
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 1
+        print(json.dumps({"ok": True, "audio": [a.to_json() for a in suggestions]}))
         return 0
     return 2
 
@@ -277,6 +380,111 @@ def cmd_ig(args: argparse.Namespace) -> int:
     return 2
 
 
+def cmd_audio(args: argparse.Namespace) -> int:
+    """Local music/SFX library — local import + CC-licensed online sources.
+    import/remove/tag/fetch are always JSON (edit_tool's convention);
+    list/search default to human-readable lines, --json switches them
+    over for the app."""
+    from dataclasses import asdict
+
+    from .audio_library import library
+    from .audio_library.sources import MissingKeyError
+    from .audio_library.sources.registry import SOURCES
+
+    if args.audio_cmd == "import":
+        items = library.import_paths(args.paths, kind=args.kind)
+        print(json.dumps({"ok": True, "items": [i.to_json() for i in items]}))
+        return 0
+
+    if args.audio_cmd == "list":
+        items = library.list_items(kind=args.kind, query=args.query)
+        if args.json:
+            print(json.dumps({"ok": True, "items": [i.to_json() for i in items]}))
+        else:
+            for i in items:
+                bpm = f"{i.bpm:.0f}bpm" if i.bpm else "-"
+                print(
+                    f"{i.id}  {i.kind:<5} {i.duration:6.1f}s {bpm:>7}  "
+                    f"{i.licence or 'local':<10} {i.name}  [{', '.join(i.tags)}]"
+                )
+        return 0
+
+    if args.audio_cmd == "remove":
+        removed = library.remove_item(args.item_id)
+        print(json.dumps({"ok": removed}))
+        return 0 if removed else 2
+
+    if args.audio_cmd == "tag":
+        item = library.update_tags(args.item_id, args.tags)
+        if item is None:
+            print(json.dumps({"ok": False, "error": f"no item {args.item_id}"}))
+            return 2
+        print(json.dumps({"ok": True, "item": item.to_json()}))
+        return 0
+
+    if args.audio_cmd == "search":
+        source_names = list(SOURCES) if args.source == "all" else [args.source]
+        max_duration = args.max_duration
+        # Freesound has no sound-effect facet to filter on server-side — a
+        # short default cap keeps --kind sfx results actually sfx-shaped.
+        if max_duration is None and args.kind == "sfx":
+            max_duration = 20.0
+        results = []
+        errors = []
+        for name in source_names:
+            try:
+                results.extend(
+                    SOURCES[name].search(
+                        args.query, kind=args.kind,
+                        max_duration=max_duration, allow_attribution=args.allow_attribution,
+                    )
+                )
+            except MissingKeyError as err:
+                errors.append(str(err))
+        if errors and not results:
+            message = "; ".join(errors)
+            if args.json:
+                print(json.dumps({"ok": False, "error": message}))
+            else:
+                print(message, file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps({"ok": True, "results": [asdict(r) for r in results]}))
+        else:
+            for r in results:
+                print(
+                    f"{r.source:<9} {r.source_id:<10} {r.duration:6.1f}s  "
+                    f"{r.licence:<10} {r.name}  ({r.attribution})"
+                )
+        return 0
+
+    if args.audio_cmd == "fetch":
+        mod = SOURCES.get(args.source)
+        if mod is None:
+            print(json.dumps({"ok": False, "error": f"unknown source {args.source!r}"}))
+            return 2
+        try:
+            result = mod.get(args.source_id)
+        except MissingKeyError as err:
+            print(json.dumps({"ok": False, "error": str(err)}))
+            return 2
+        if result is None:
+            print(json.dumps({"ok": False, "error": f"{args.source} {args.source_id} not found, or its licence isn't CC0/CC-BY"}))
+            return 2
+        item = mod.download(result)
+        print(json.dumps({"ok": True, "item": item.to_json()}))
+        return 0
+
+    if args.audio_cmd == "bootstrap":
+        from .audio_library import starter_pack
+
+        emit = _progress_printer(args.jsonl)
+        items = starter_pack.bootstrap(lambda f, m: emit("bootstrap", f, m))
+        _emit_result(args.jsonl, {"ok": True, "items": [i.to_json() for i in items]})
+        return 0
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="publikclip")
     parser.add_argument("--jsonl", action="store_true", help="machine-readable progress on stdout")
@@ -284,14 +492,14 @@ def main(argv: list[str] | None = None) -> int:
 
     p_run = sub.add_parser("run", help="process a YouTube URL or local video file")
     p_run.add_argument("source")
-    p_run.add_argument("--llm", choices=["gemini", "ollama"], default=None)
+    p_run.add_argument("--llm", choices=["publik", "gemini", "ollama"], default=None)
     p_run.add_argument("--captions", default=None, help="caption preset name")
     p_run.add_argument("--camera", choices=["cut", "pan", "locked"], default=None)
     p_run.set_defaults(fn=cmd_run)
 
     p_resume = sub.add_parser("resume", help="resume a job from its checkpoints")
     p_resume.add_argument("job_id")
-    p_resume.add_argument("--llm", choices=["gemini", "ollama"], default=None)
+    p_resume.add_argument("--llm", choices=["publik", "gemini", "ollama"], default=None)
     p_resume.add_argument("--captions", default=None, help="caption preset name")
     p_resume.add_argument("--camera", choices=["cut", "pan", "locked"], default=None)
     p_resume.set_defaults(fn=cmd_resume)
@@ -311,6 +519,9 @@ def main(argv: list[str] | None = None) -> int:
     p_rcl = edit_sub.add_parser("render-clip")
     p_rcl.add_argument("job_id")
     p_rcl.add_argument("clip", type=int)
+    p_as = edit_sub.add_parser("audio-suggest", help="suggest music/sfx for a clip (prints JSON, does not save)")
+    p_as.add_argument("job_id")
+    p_as.add_argument("clip", type=int)
     p_edit.set_defaults(fn=cmd_edit)
 
     p_ig = sub.add_parser("ig", help="Instagram feedback loop (your own Meta app)")
@@ -336,6 +547,41 @@ def main(argv: list[str] | None = None) -> int:
     p_report = ig_sub.add_parser("report", help="score-vs-outcome calibration report")
     p_report.add_argument("--metric", default="views")
     p_ig.set_defaults(fn=cmd_ig)
+
+    p_audio = sub.add_parser("audio", help="local music/SFX library")
+    audio_sub = p_audio.add_subparsers(dest="audio_cmd", required=True)
+
+    p_a_import = audio_sub.add_parser("import", help="import local files or folders")
+    p_a_import.add_argument("paths", nargs="+")
+    p_a_import.add_argument("--kind", choices=["auto", "music", "sfx"], default="auto")
+
+    p_a_list = audio_sub.add_parser("list", help="list library items")
+    p_a_list.add_argument("--kind", choices=["music", "sfx"], default=None)
+    p_a_list.add_argument("--query", default=None)
+    p_a_list.add_argument("--json", action="store_true")
+
+    p_a_remove = audio_sub.add_parser("remove", help="remove a library item")
+    p_a_remove.add_argument("item_id")
+
+    p_a_tag = audio_sub.add_parser("tag", help="set an item's tags")
+    p_a_tag.add_argument("item_id")
+    p_a_tag.add_argument("tags", nargs="+")
+
+    p_a_search = audio_sub.add_parser("search", help="search CC-licensed online sources")
+    p_a_search.add_argument("query")
+    p_a_search.add_argument("--source", choices=["freesound", "jamendo", "all"], default="all")
+    p_a_search.add_argument("--kind", choices=["music", "sfx"], default="music")
+    p_a_search.add_argument("--max-duration", type=float, default=None)
+    p_a_search.add_argument("--allow-attribution", action="store_true")
+    p_a_search.add_argument("--json", action="store_true")
+
+    p_a_fetch = audio_sub.add_parser("fetch", help="download one known online item by id")
+    p_a_fetch.add_argument("source", choices=["freesound", "jamendo"])
+    p_a_fetch.add_argument("source_id")
+
+    audio_sub.add_parser("bootstrap", help="fetch a curated CC0 starter pack (music + sfx)")
+
+    p_audio.set_defaults(fn=cmd_audio)
 
     args = parser.parse_args(argv)
     return args.fn(args)

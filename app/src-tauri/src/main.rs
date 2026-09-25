@@ -11,7 +11,9 @@ use std::process::{Command, Stdio};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 
-fn home_dir() -> PathBuf {
+mod publik;
+
+pub(crate) fn home_dir() -> PathBuf {
     if let Ok(custom) = std::env::var("PUBLIKCLIP_HOME") {
         return PathBuf::from(custom);
     }
@@ -26,16 +28,42 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
+/// Where uv is allowed to create the pipeline's virtualenv.
+///
+/// A packaged build must never let uv create `.venv` next to the bundled
+/// pipeline source: on macOS that path is `publikclip.app/Contents/Resources`,
+/// inside the signed bundle, and the first write there invalidates the code
+/// signature — Gatekeeper then refuses to launch an app that opened fine a
+/// moment earlier. (Windows survives it today only because NSIS installs
+/// under LOCALAPPDATA, which happens to be writable.) Point uv at
+/// PUBLIKCLIP_HOME instead, where every other piece of mutable state already
+/// lives, so the bundle stays byte-identical to what was notarized.
+///
+/// Dev builds keep using the repo's own pipeline/.venv.
+fn uv_project_environment() -> Option<PathBuf> {
+    if cfg!(debug_assertions) {
+        None
+    } else {
+        Some(home_dir().join("env"))
+    }
+}
+
 /// Command that never flashes a console window on Windows (CREATE_NO_WINDOW).
 /// Every pipeline/tool spawn goes through this — a GUI app popping cmd.exe
 /// windows for each sidecar call reads as malware to most people.
-fn quiet_command(program: &str) -> Command {
+pub(crate) fn quiet_command(program: &str) -> Command {
     #[allow(unused_mut)]
     let mut cmd = Command::new(program);
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    // Set here rather than at each uv call site: there are six of them, and a
+    // site that forgets it silently writes into the app bundle. Harmless on
+    // the one spawn that isn't uv (curl).
+    if let Some(env_dir) = uv_project_environment() {
+        cmd.env("UV_PROJECT_ENVIRONMENT", env_dir);
     }
     cmd
 }
@@ -80,6 +108,11 @@ fn pipeline_invocation() -> (String, Vec<String>) {
                 "--directory".to_string(),
                 resources.join("pipeline").to_string_lossy().to_string(),
                 "run".to_string(),
+                // Never re-resolve: re-locking would rewrite uv.lock inside
+                // the bundle, which is the same signature-breaking write that
+                // uv_project_environment() exists to prevent. The bundle ships
+                // a lock that matches the pyproject.toml beside it.
+                "--frozen".to_string(),
                 "publikclip".to_string(),
             ],
         )
@@ -154,17 +187,51 @@ fn stream_pipeline(app: &AppHandle, program: &str, args: &[String]) {
             return;
         }
     };
+    let mut saw_result = false;
     if let Some(stdout) = child.stdout.take() {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                if value.get("event").and_then(Value::as_str) == Some("result") {
+                    saw_result = true;
+                }
                 let _ = app.emit("pipeline-event", value);
             }
         }
     }
     if let Ok(status) = child.wait() {
-        if !status.success() {
+        // The CLI emits a structured `result` event before returning nonzero
+        // for an expected stage failure. Emitting `exited` as well races the
+        // frontend listener and replaces the useful stage error with the
+        // generic "exited unexpectedly" banner. Reserve `exited` for a
+        // sidecar that died before it could report a result (panic, signal,
+        // launch/runtime failure).
+        if should_emit_exited(status.success(), saw_result) {
             let _ = app.emit("pipeline-event", json!({"event": "exited", "code": status.code()}));
         }
+    }
+}
+
+fn should_emit_exited(success: bool, saw_result: bool) -> bool {
+    !success && !saw_result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_emit_exited;
+
+    #[test]
+    fn structured_failure_does_not_become_generic_exit() {
+        assert!(!should_emit_exited(false, true));
+    }
+
+    #[test]
+    fn sidecar_without_result_still_reports_exit() {
+        assert!(should_emit_exited(false, false));
+    }
+
+    #[test]
+    fn successful_sidecar_never_reports_exit() {
+        assert!(!should_emit_exited(true, false));
     }
 }
 
@@ -221,20 +288,7 @@ fn list_job_dirs() -> Result<Vec<Value>, String> {
 
 #[tauri::command]
 fn save_gemini_key(key: String) -> Result<bool, String> {
-    let home = home_dir();
-    fs::create_dir_all(&home).map_err(|e| e.to_string())?;
-    let path = home.join("secrets.json");
-    let mut current: Value = fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({}));
-    current["gemini_api_key"] = json!(key.trim());
-    fs::write(&path, serde_json::to_string_pretty(&current).unwrap()).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-    }
+    publik::merge_secret("gemini_api_key", json!(key.trim()))?;
     Ok(true)
 }
 
@@ -274,29 +328,52 @@ async fn check_ollama() -> Result<Value, String> {
     Ok(json!({"running": true, "models": models}))
 }
 
-/// Sync pipeline call that returns one JSON blob (edit context, visual
-/// suggestions). Long-running render-clip goes through run_edit_render
-/// instead so progress streams.
-#[tauri::command]
-async fn edit_tool(args: Vec<String>) -> Result<Value, String> {
+/// Run `publikclip <args...>` and parse the last JSON line — the contract
+/// edit_tool/ig_tool/the audio_* commands all rely on (progress lines, if
+/// any, may precede the final payload).
+fn run_cli_json(args: Vec<String>) -> Result<Value, String> {
     let (program, base_args) = pipeline_invocation();
     let mut full = base_args;
-    full.push("edit".to_string());
     full.extend(args);
     let out = quiet_command(&program)
         .args(&full)
         .output()
         .map_err(|e| e.to_string())?;
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // last JSON line is the payload (progress lines may precede it)
     let line = stdout.lines().rev().find(|l| l.trim_start().starts_with('{'));
     match line.and_then(|l| serde_json::from_str::<Value>(l).ok()) {
         Some(v) => Ok(v),
         None => Err(format!(
-            "edit tool produced no JSON: {}",
+            "publikclip produced no JSON: {}",
             String::from_utf8_lossy(&out.stderr).chars().take(400).collect::<String>()
         )),
     }
+}
+
+/// Sync pipeline call that returns one JSON blob (edit context, visual
+/// suggestions). Long-running render-clip goes through run_edit_render
+/// instead so progress streams.
+#[tauri::command]
+async fn edit_tool(args: Vec<String>) -> Result<Value, String> {
+    let mut full = vec!["edit".to_string()];
+    full.extend(args);
+    run_cli_json(full)
+}
+
+/// Fetches the curated starter pack — can take a while (several downloads),
+/// so it streams progress over the same pipeline-event channel as
+/// run_job/run_edit_render rather than blocking behind a sync call.
+#[tauri::command]
+fn run_audio_bootstrap(app: AppHandle) -> Result<(), String> {
+    let (program, base_args) = pipeline_invocation();
+    std::thread::spawn(move || {
+        let mut args = base_args.clone();
+        args.push("--jsonl".to_string());
+        args.push("audio".to_string());
+        args.push("bootstrap".to_string());
+        stream_pipeline(&app, &program, &args);
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -333,6 +410,13 @@ fn save_clip_edits(job_id: String, edits: Value) -> Result<(), String> {
 
 #[tauri::command]
 fn save_pexels_key(key: String) -> Result<bool, String> {
+    // Same merge + chmod 600 path as every other key (a Pexels-first user
+    // used to get the umask default here).
+    publik::merge_secret("pexels_api_key", json!(key.trim()))?;
+    Ok(true)
+}
+
+fn save_secret(secret_key: &str, value: String) -> Result<bool, String> {
     let home = home_dir();
     fs::create_dir_all(&home).map_err(|e| e.to_string())?;
     let path = home.join("secrets.json");
@@ -340,9 +424,108 @@ fn save_pexels_key(key: String) -> Result<bool, String> {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| json!({}));
-    current["pexels_api_key"] = json!(key.trim());
+    current[secret_key] = json!(value.trim());
     fs::write(&path, serde_json::to_string_pretty(&current).unwrap()).map_err(|e| e.to_string())?;
     Ok(true)
+}
+
+#[tauri::command]
+fn save_freesound_key(key: String) -> Result<bool, String> {
+    save_secret("freesound_key", key)
+}
+
+#[tauri::command]
+fn save_jamendo_key(key: String) -> Result<bool, String> {
+    save_secret("jamendo_client_id", key)
+}
+
+#[tauri::command]
+fn audio_keys_status() -> Result<Value, String> {
+    let secrets = home_dir().join("secrets.json");
+    let data: Value = fs::read_to_string(&secrets)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}));
+    let has = |k: &str| data[k].as_str().map(|v| !v.is_empty()).unwrap_or(false);
+    Ok(json!({
+        "has_freesound_key": has("freesound_key"),
+        "has_jamendo_key": has("jamendo_client_id"),
+    }))
+}
+
+/// Local music/sfx library — import/list/remove, all shelling to `publikclip
+/// audio ...` like edit_tool shells to `publikclip edit ...`.
+#[tauri::command]
+async fn audio_import(paths: Vec<String>, kind: String) -> Result<Value, String> {
+    let mut args = vec!["audio".to_string(), "import".to_string()];
+    args.extend(paths);
+    args.push("--kind".to_string());
+    args.push(kind);
+    run_cli_json(args)
+}
+
+#[tauri::command]
+async fn audio_list(kind: Option<String>, query: Option<String>) -> Result<Value, String> {
+    let mut args = vec!["audio".to_string(), "list".to_string(), "--json".to_string()];
+    if let Some(k) = kind {
+        args.push("--kind".to_string());
+        args.push(k);
+    }
+    if let Some(q) = query {
+        if !q.is_empty() {
+            args.push("--query".to_string());
+            args.push(q);
+        }
+    }
+    run_cli_json(args)
+}
+
+#[tauri::command]
+async fn audio_remove(id: String) -> Result<Value, String> {
+    run_cli_json(vec!["audio".to_string(), "remove".to_string(), id])
+}
+
+#[tauri::command]
+async fn audio_search(
+    query: String,
+    source: String,
+    kind: String,
+    max_duration: Option<f64>,
+    allow_attribution: bool,
+) -> Result<Value, String> {
+    let mut args = vec![
+        "audio".to_string(),
+        "search".to_string(),
+        query,
+        "--source".to_string(),
+        source,
+        "--kind".to_string(),
+        kind,
+        "--json".to_string(),
+    ];
+    if let Some(d) = max_duration {
+        args.push("--max-duration".to_string());
+        args.push(d.to_string());
+    }
+    if allow_attribution {
+        args.push("--allow-attribution".to_string());
+    }
+    run_cli_json(args)
+}
+
+#[tauri::command]
+async fn audio_fetch(source: String, source_id: String) -> Result<Value, String> {
+    run_cli_json(vec!["audio".to_string(), "fetch".to_string(), source, source_id])
+}
+
+#[tauri::command]
+async fn audio_suggest(job_id: String, clip: u32) -> Result<Value, String> {
+    run_cli_json(vec![
+        "edit".to_string(),
+        "audio-suggest".to_string(),
+        job_id,
+        clip.to_string(),
+    ])
 }
 
 #[tauri::command]
@@ -390,23 +573,9 @@ async fn ig_connect(app_id: String, app_secret: String) -> Result<String, String
 /// (sync / overview / link / unlink / reject — same contract as edit_tool).
 #[tauri::command]
 async fn ig_tool(args: Vec<String>) -> Result<Value, String> {
-    let (program, base_args) = pipeline_invocation();
-    let mut full = base_args;
-    full.push("ig".to_string());
+    let mut full = vec!["ig".to_string()];
     full.extend(args);
-    let out = quiet_command(&program)
-        .args(&full)
-        .output()
-        .map_err(|e| e.to_string())?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let line = stdout.lines().rev().find(|l| l.trim_start().starts_with('{'));
-    match line.and_then(|l| serde_json::from_str::<Value>(l).ok()) {
-        Some(v) => Ok(v),
-        None => Err(format!(
-            "ig tool produced no JSON: {}",
-            String::from_utf8_lossy(&out.stderr).chars().take(400).collect::<String>()
-        )),
-    }
+    run_cli_json(full)
 }
 
 #[tauri::command]
@@ -457,7 +626,20 @@ fn main() {
             run_edit_render,
             save_clip_edits,
             save_pexels_key,
-            export_clip
+            export_clip,
+            publik::publik_provision,
+            publik::publik_status,
+            publik::publik_disconnect,
+            save_freesound_key,
+            save_jamendo_key,
+            audio_keys_status,
+            audio_import,
+            audio_list,
+            audio_remove,
+            audio_search,
+            audio_fetch,
+            audio_suggest,
+            run_audio_bootstrap
         ])
         .setup(|app| {
             let _ = app.get_webview_window("main");

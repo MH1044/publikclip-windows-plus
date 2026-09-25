@@ -1,7 +1,72 @@
 import { useEffect, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
+import { openUrl } from '@tauri-apps/plugin-opener'
+import { api } from '../api'
+import type { PublikStatus } from '../types'
+import { PUBLIK_DATA_PATH, PUBLIK_PRE_SETUP, PublikReady } from './PublikCard'
 
-/** Post-onboarding key management — the onboarding-only input was a gap. */
+/** Post-onboarding brain + key management: publik API first, then your own
+ * Gemini key, then Pexels. */
+
+function PublikRow() {
+  const [publik, setPublik] = useState<PublikStatus | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [note, setNote] = useState<string | null>(null)
+
+  useEffect(() => {
+    api.publikStatus().then(setPublik).catch(() => setPublik(null))
+  }, [])
+
+  async function act(fn: () => Promise<PublikStatus>) {
+    setBusy(true)
+    setNote(null)
+    try {
+      setPublik(await fn())
+    } catch (err) {
+      setNote(String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const ready = publik?.provisioned && !publik.status?.disconnected
+  const state = publik === null
+    ? 'checking…'
+    : publik.status?.disconnected
+      ? 'Disconnected'
+      : publik.provisioned
+        ? 'Ready'
+        : 'Not set up'
+
+  return (
+    <div className="publik-row">
+      <p className="audit-label">PUBLIK API · {state.toUpperCase()}</p>
+      {ready && publik ? (
+        <PublikReady publik={publik} />
+      ) : (
+        <>
+          <p className="ig-intro">{PUBLIK_PRE_SETUP}</p>
+          <p className="ig-intro">{PUBLIK_DATA_PATH}</p>
+        </>
+      )}
+      <div className="publik-actions">
+        {ready ? (
+          <button className="btn-ghost" disabled={busy} onClick={() => act(api.publikDisconnect)}>
+            Disconnect publik API
+          </button>
+        ) : (
+          <button className="btn-secondary" disabled={busy || publik === null} onClick={() => act(api.publikProvision)}>
+            {busy ? 'Setting up…' : publik?.status?.disconnected ? 'Reconnect publik API' : 'Set up publik API'}
+          </button>
+        )}
+        <button className="btn-ghost" onClick={() => openUrl('https://publikhq.com/developers#why')}>
+          How pricing works ↗
+        </button>
+      </div>
+      {note && <p className="ig-message mono">{note}</p>}
+    </div>
+  )
+}
 
 interface Props {
   onClose: () => void
@@ -24,6 +89,58 @@ function PexelsField() {
         disabled={!key.trim()}
         onClick={async () => {
           await invoke('save_pexels_key', { key })
+          setSaved(true)
+        }}
+      >
+        {saved ? 'saved ✓' : 'save'}
+      </button>
+    </div>
+  )
+}
+
+function FreesoundField() {
+  const [key, setKey] = useState('')
+  const [saved, setSaved] = useState(false)
+  return (
+    <div className="ig-form">
+      <input
+        placeholder="Freesound API key (free — freesound.org/apiv2/apply)"
+        type="password"
+        value={key}
+        onChange={(e) => setKey(e.target.value)}
+        className="mono"
+      />
+      <button
+        className="btn-secondary"
+        disabled={!key.trim()}
+        onClick={async () => {
+          await invoke('save_freesound_key', { key })
+          setSaved(true)
+        }}
+      >
+        {saved ? 'saved ✓' : 'save'}
+      </button>
+    </div>
+  )
+}
+
+function JamendoField() {
+  const [key, setKey] = useState('')
+  const [saved, setSaved] = useState(false)
+  return (
+    <div className="ig-form">
+      <input
+        placeholder="Jamendo client id (free — devportal.jamendo.com)"
+        type="password"
+        value={key}
+        onChange={(e) => setKey(e.target.value)}
+        className="mono"
+      />
+      <button
+        className="btn-secondary"
+        disabled={!key.trim()}
+        onClick={async () => {
+          await invoke('save_jamendo_key', { key })
           setSaved(true)
         }}
       >
@@ -58,10 +175,12 @@ export default function KeyModal({ onClose }: Props) {
           <p className="audit-kicker">THE BRAIN</p>
           <button className="btn-ghost" onClick={onClose}>close ✕</button>
         </header>
+        <PublikRow />
+        <p className="audit-label" style={{ marginTop: 22 }}>YOUR OWN GEMINI KEY</p>
         <p className="ig-intro">
-          Gemini scores your moments at full quality (~<span className="mono">$0.15</span>/hr
-          of source). The key lives in <span className="mono">~/.publikclip/secrets.json</span>,
-          chmod 600, and never goes anywhere but Google.{' '}
+          Prefer your own Google key? Gemini scores at the same quality; your key lives
+          in <span className="mono">~/.publikclip/secrets.json</span>, chmod 600, and
+          never goes anywhere but Google.{' '}
           {hasKey && <strong>A key is currently saved{saved ? ' — updated ✓' : ''}.</strong>}
         </p>
         <div className="ig-form">
@@ -79,6 +198,10 @@ export default function KeyModal({ onClose }: Props) {
         </div>
         <p className="audit-label" style={{ marginTop: 22 }}>PEXELS (STOCK VISUALS)</p>
         <PexelsField />
+        <p className="audit-label" style={{ marginTop: 22 }}>FREESOUND (SOUND EFFECTS)</p>
+        <FreesoundField />
+        <p className="audit-label" style={{ marginTop: 22 }}>JAMENDO (MUSIC)</p>
+        <JamendoField />
         <p className="ig-message mono">
           Applies to new runs; a job mid-flight keeps the brain it started with.
         </p>

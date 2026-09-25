@@ -82,6 +82,83 @@ export interface SetupState {
   onboarded: boolean
 }
 
+/** publik_status: everything the UI shows about publik API — never the key. */
+export interface PublikStatus {
+  provisioned: boolean
+  claim_state: 'anonymous' | 'claimed'
+  claim_url: string | null
+  add_credit_url: string | null
+  /** from POST /installs, shown verbatim — the app never writes its own */
+  disclosure: { version?: number; cost?: string; data_path?: string } | null
+  /** ~/.publikclip/publik-status.json, rewritten by the pipeline after every call */
+  status: {
+    balance_micros?: number | null
+    starter_micros?: number | null
+    starter_remaining_micros?: number | null
+    last_charge_micros?: number
+    claim_state?: 'anonymous' | 'claimed'
+    needs_credit?: boolean
+    disconnected?: boolean
+    reprovision?: boolean
+    top_up_url?: string | null
+    message?: string | null
+    updated_at?: number
+  }
+}
+
+/* ---------- music / sfx library ---------- */
+
+export interface LibraryItem {
+  id: string
+  path: string
+  kind: 'music' | 'sfx'
+  name: string
+  duration: number
+  bpm: number | null
+  tags: string[]
+  source: 'local' | 'freesound' | 'jamendo'
+  source_id: string | null
+  source_url: string | null
+  licence: string | null
+  attribution: string | null
+  added_at: string
+}
+
+export interface AudioItem {
+  id: string
+  library_id: string
+  path: string
+  kind: 'music' | 'sfx'
+  start: number
+  duration: number
+  gain_db: number
+  fade_in: number
+  fade_out: number
+  loop: boolean
+  duck: boolean
+  suggested: boolean
+}
+
+export interface OnlineAudioResult {
+  source: 'freesound' | 'jamendo'
+  source_id: string
+  name: string
+  duration: number
+  tags: string[]
+  kind: 'music' | 'sfx'
+  licence: string
+  attribution: string
+  download_url: string
+  page_url: string
+  rating: number
+  downloads: number
+}
+
+export interface AudioKeysStatus {
+  has_freesound_key: boolean
+  has_jamendo_key: boolean
+}
+
 /* ---------- the Instagram loop ---------- */
 
 export interface LoopMetrics {
